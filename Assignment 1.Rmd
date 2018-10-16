@@ -1,0 +1,243 @@
+---
+title: "R Notebook"
+output: rmarkdown::github_document
+---
+# Setting up the environment for analysis
+```{r setup, include=FALSE, echo = FALSE}
+library("tmap")
+library("pdftools")
+library("RSocrata")
+library("sf")
+library("lubridate")
+library("tidyverse")
+```
+
+# scraping with API
+We will be working with crime data in 2016
+```{r}
+socrata.file <- "https://data.cityofchicago.org/resource/kf95-mnd6.csv"
+crime.data <- read.socrata(socrata.file)
+head(crime.data)
+```
+The data clearly shows how there are lots of missing data. In particular, the `Date` column is done practially useless. This is perfectly fine, because the objective of this project is to create point graphs and choropleth graphs, which do not have inherent date specifications.
+
+```{r}
+dim(crime.data)
+unique(crime.data$Primary.Type)
+```
+So, a more effective way of reducing this dataset will be selecting a type of crime. Let's restrict this to NARCOTIC cases.
+Looking back, there needed to be more restriction. Thankfully, the Incidence reports are strictly increasing. So, I found the last police record of January to be 10399221. We will use this to find incidences of January of 2018
+
+```{r}
+crime.data %>%
+  filter(Primary.Type == "NARCOTICS") %>%
+  filter(ID <= 10399221)-> narc.data
+dim(narc.data)
+```
+Now the data is in a much more reasonable size. 952 rows! But we definitely do not need all the columns
+
+```{r}
+names(narc.data)
+```
+For our analysis, we only really need the `Community.Area`, `Latitute`, and `Longitude`.
+
+```{r}
+narc.data %>% select(comm = Community.Area, 
+                     lat = Latitude, long = Longitude) -> narc.final
+head(narc.final)
+```
+
+# Creating a point layer
+Now, we will use the features in the `sp` package that will allow us to create a spatial points layer. We will use the `lat` and `lon` for this.
+But in order for this process to be successful, I must eliminate all the missing data points.
+```{r}
+narc.coord <- narc.final %>% filter(!is.na(lat))
+dim(narc.coord)
+```
+There is one data point without coordinates
+
+Within the `sf` package, there is the `st_as_sf` function that converts coordinates to spatial objects. So, this is the command that we will be using:
+```{r}
+narc.points = st_as_sf(narc.coord, coords = c("long", "lat"), crs = 4326, agr = "constant")
+class(narc.points)
+```
+Now that we are certain that this is in the correct format, we will plot the points
+```{r}
+plot(narc.points)
+```
+
+## Community Area boundary file
+`sf` can read a geojson formatted file directly from the web, and we will exploit that functionality. So we will call this information directly from the Chicago Data Portal.
+```{r}
+comm.file <- "https://data.cityofchicago.org/resource/igwz-8jzy.geojson"
+chicago.comm <- read_sf(comm.file)
+class(chicago.comm)
+```
+
+```{r}
+st_crs(chicago.comm)
+```
+
+```{r}
+head(chicago.comm)
+```
+Before moving on to the spatial join operation, we will convert both the community area boundaries and the narcotics points to the same projection, using the `st_transform` command. We assign the UTM (Universal Tranverse Mercator) zone 16N, which the the proper one for Chicago, with an EPSG code of 32616. After the projection transformation, we check the result using `st_crs`.
+
+```{r}
+chicago.comm <- st_transform(chicago.comm,32616)
+st_crs(chicago.comm)
+narc.points <- st_transform(narc.points,32616)
+st_crs(narc.points)
+```
+
+# Spatial Join
+```{r}
+comm.pts <- st_join(narc.points, chicago.comm["area_num_1"])
+head(comm.pts)
+```
+
+```{r}
+is.numeric(comm.pts$area_num_1)
+comm.pts$area_num_1 <- as.integer(comm.pts$area_num_1)
+is.integer(comm.pts$area_num_1)
+chicago.comm$area_num_1 <- as.integer(chicago.comm$area_num_1)
+```
+
+# Counts by community area
+```{r}
+st_geometry(comm.pts) <- NULL
+class(comm.pts)
+```
+
+
+```{r}
+narc.cnts <- comm.pts %>% count(area_num_1)
+narc.cnts <- narc.cnts %>% rename(comm = area_num_1, AGG.COUNT = n)
+
+head(narc.cnts)
+```
+
+# Mapping the Narcotics counts
+Now that we have a polygon layer with some identifiers (`chicago.comm`) and a community identifier and the aggregate vehicle count (`narc.cnts`), we will do a `left_join` command.
+```{r}
+chicago.comm <- left_join(chicago.comm,narc.cnts, by = c("area_num_1" = "comm"))
+head(chicago.comm)
+```
+
+# Basic choropleth map
+```{r}
+tm_shape(chicago.comm) +
+  tm_polygons("AGG.COUNT")
+```
+
+# --------------------------------------------------------------------
+# Extracting a pdf file
+We will use the `pdftools` package to turn the contents of a pdf file into a list of long character strings.
+```{r}
+pdf.file <- "http://www.actforchildren.org/wp-content/uploads/2017/02/Census-Data-by-Chicago-Community-Area-2016.pdf"
+pop.dat <- pdf_text(pdf.file)
+class(pop.dat)
+pop.dat[1]
+```
+We realize that this extracts each page as a single entry.
+```{r}
+length(pop.dat)
+```
+
+We will extract the population information from this unknown data type of strings.
+This information will be initialized in `nnlist`.
+We will store each line into this list, by parsing it with the new line character `/n`.
+```{r}
+nnlist <- ""
+ppage <- strsplit(pop.dat[[1]],split="\n")
+ppage[[1]]
+```
+
+The first eleven lines are useless for our purpose. So, we will eliminate them
+```{r}
+nni <- ppage[[1]]
+nni <- nni[-(1:11)]
+nni
+```
+
+Now we append this with the information on the next page:
+```{r}
+nnu <- unlist(nni)
+nnlist <- c(nnlist,nnu)
+
+nnlist <- ""
+for (i in 1:2) {
+  ppage <- strsplit(pop.dat[[i]],split="\n")
+  nni <- ppage[[1]]
+  nni <- nni[-(1:11)]
+  nnu <- unlist(nni)
+  nnlist <- c(nnlist,nnu)
+}
+# we extract the first and last elements, as they are not meaningful to our analysis
+nnlist <- nnlist[2:(length(nnlist)-2)]
+nnlist <- nnlist[-43]
+```
+
+# Extracting the population values
+```{r}
+nnpop <- vector(mode = "numeric", length = length(nnlist))
+for (i in (1:length(nnlist))) {
+  popchar <- strsplit(nnlist[i], "\\s+")
+  popchar <- popchar[[1]][1:5]
+  if(grepl(",", popchar[3])) {
+    popval <- as.numeric(gsub(",", "", popchar[3]))
+    nnpop[i] <- popval
+    } else if(grepl(",", popchar[4])){
+    popval <- as.numeric(gsub(",", "", popchar[4]))
+    nnpop[i] <- popval
+  } else if(grepl(",", popchar[5])){
+    popval <- as.numeric(gsub(",", "", popchar[5]))
+    nnpop[i] <- popval
+  }
+}
+
+nnpop
+```
+
+Then, we want to create an indexing for these values;
+```{r}
+nnid <- (1:length(nnlist))
+nnid
+```
+
+Now, we will convert `nnid` and ``nnpop` into a data frame using the `data.frame` command. 
+```{r}
+neighpop <- data.frame(as.integer(nnid), nnpop)
+names(neighpop) <- c("NID", "POP2016")
+head(neighpop)
+```
+
+
+# Mapping Community Area Abandoned Vehicles per Capita
+## Computing abandoned vehicles per capita
+```{r}
+chicago.comm <- left_join(chicago.comm, neighpop, by = c("area_num_1" = "NID"))
+head(chicago.comm)
+```
+
+```{r}
+chicago.comm <- chicago.comm %>% mutate(narcpcap = (AGG.COUNT / POP2016) * 1000) 
+head(chicago.comm)
+```
+
+# Final choropleth map
+```{r}
+tm_shape(chicago.comm) +
+  tm_polygons("narcpcap")
+```
+
+This result is completely crazy!
+`narcpcap` maximum is 7.5.
+This is East Garfield Park
+The second highest is North Lawndale.
+
+```{r}
+st_write(chicago.comm,"chicago_narc",driver="ESRI Shapefile")
+
+```
+
